@@ -52,21 +52,22 @@ def main(debug=False):
         width = screen.width
         height = screen.height
 
-        curX, curY = width / 2, height / 2
-        while True:
-            updated = False
-            packet = emotiv.dequeue()
-            if abs(packet.gyroX) > 1:
-                curX -= packet.gyroX
-                updated = True
-            if abs(packet.gyroY) > 1:
-                curY += packet.gyroY
-                updated = True
-            curX = max(0, min(curX, width))
-            curY = max(0, min(curY, height))
-            if updated:
-                screen.move_mouse(curX, curY)
-            gevent.sleep(0)
+    curX, curY = width / 2, height / 2
+    while True:
+        updated = False
+        packet = emotiv.dequeue()
+        print "%s %s" % (packet.gyroX, packet.gyroY)
+        if abs(packet.gyroX) > 1:
+            curX -= packet.gyroX
+            updated = True
+        if abs(packet.gyroY) > 1:
+            curY += packet.gyroY
+            updated = True
+        curX = max(0, min(curX, width))
+        curY = max(0, min(curY, height))
+        if updated:
+            screen.move_mouse(curX, curY)
+        gevent.sleep(0)
 
 
 emotiv = None
