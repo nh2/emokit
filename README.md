@@ -77,7 +77,7 @@ Python library
     if __name__ == "__main__":
       headset = emotiv.Emotiv()    
       gevent.spawn(headset.setup)
-      gevent.sleep(1)
+      gevent.sleep(0)
       try:
         while True:
           packet = headset.dequeue()
