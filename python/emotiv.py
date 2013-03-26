@@ -1,4 +1,6 @@
 import gevent
+import threading
+import Queue as ThreadingQueue
 
 try:
     import pywinusb.hid as hid
@@ -6,6 +8,18 @@ try:
     windows = True
 except:
     windows = False
+
+# How long to gevent-sleep if there is no data on the EEG.
+# To be precise, this is not the frequency to poll on the input device
+# (which happens with a blocking read), but how often the gevent thread
+# polls the real threading queue that reads the data in a separete thread
+# to not block gevent with the file read().
+# This is the main latency control.
+# Setting it to 1ms takes about 10% CPU on a Core i5 mobile.
+# You can set this lower to reduce idle CPU usage; it has no effect
+# as long as data is being read from the queue, so it is rather a
+# "resume" delay.
+DEVICE_POLL_INTERVAL = 0.001  # in seconds
 
 import os
 from gevent.queue import Queue
@@ -336,20 +350,64 @@ class Emotiv(object):
                 self.hidraw = open("/dev/hidraw4")
             gevent.spawn(self.setupCrypto, self.serialNum)
             gevent.spawn(self.updateStdout)
-        while self._goOn:
+
+        # 'Real threading' queues whose values are put into the
+        # 'tasks' gevent queue (or 'packet' if the data is already decrypted)
+        # as soon as possible.
+        # We use these and `hidraw.read` in a real thread so that reading
+        # from the file does not block gevent (this would result in unexpected
+        # blocking-for-input on repeated `gevent.sleep(0)` calls, destroying
+        # gevents whole point.
+        # The data goes like this:
+        #    already decrypted data -> decrypted_threading_q           -> self.packets
+        #    encrypted data         -> to_decrypt_threading_q -> tasks -> self.packets
+        to_decrypt_threading_q = ThreadingQueue.Queue()
+        decrypted_threading_q = ThreadingQueue.Queue()
+
+        def thread_read_from_device_loop():
             try:
-                data = self.hidraw.read(32)
-                if data != "":
-                    if _os_decryption:
-                        self.packets.put_nowait(EmotivPacket(data))
-                    else:
-                        #Queue it!
-                        self.packetsReceived += 1
-                        tasks.put_nowait(data)
-                        gevent.sleep(0)
+                while self._goOn:
+                    data = self.hidraw.read(32)
+                    if data != "":
+                        if _os_decryption:
+                            # The data is already decrypted (e.g. by emokitd)
+                            # so put it directly in the decrypted packets queue
+                            decrypted_threading_q.put_nowait(EmotivPacket(data))
+                        else:
+                            # The data is not yet decrypted, queue it for decryption
+                            to_decrypt_threading_q.put_nowait(data)
             except KeyboardInterrupt:
-                self._goOn = False
-        return True
+                pass  # Simply stop
+
+        # Start reading from device in separate real thread to not block gevent
+        t = threading.Thread(target=thread_read_from_device_loop)
+        t.daemon = True
+        t.start()
+
+        # In the normal (a gevent) thread, poll the queues filled by the
+        # thread_read_from_device_loop an put all elements in the corresponding
+        # gevent queues.
+        try:
+            # We cannot blocking-get() on the queues here to not block gevent.
+            while True:
+                # The queue which has data if any
+                q = (decrypted_threading_q if not decrypted_threading_q.empty()
+                    else to_decrypt_threading_q if not to_decrypt_threading_q.empty()
+                    else None)
+
+                if q:
+                    data = q.get(block=False)  # cannot fail since not empty
+                    self.packetsReceived += 1
+                    tasks.put_nowait(data)
+                    gevent.sleep(0)  # yield to process new data with low latency
+                else:
+                    # No new data from the device; yield
+                    # We cannot sleep(0) here because that would go 100% CPU if both queues are empty
+                    gevent.sleep(DEVICE_POLL_INTERVAL)
+        except KeyboardInterrupt:
+            self._goOn = False  # This also stops the device reading thread
+
+        t.join()
 
     def setupCrypto(self, sn):
         type = 0 #feature[5]
@@ -391,14 +449,12 @@ class Emotiv(object):
         cipher = AES.new(key, AES.MODE_ECB, iv)
         for i in k: print "0x%.02x " % (ord(i))
         while self._goOn:
-            while not tasks.empty():
-                task = tasks.get()
-                data = cipher.decrypt(task[:16]) + cipher.decrypt(task[16:])
-                self.lastPacket = EmotivPacket(data, self.sensors)
-                self.packets.put_nowait(self.lastPacket)
-                self.packetsProcessed += 1
-                gevent.sleep(0)
-            gevent.sleep(0)
+
+            task = tasks.get()
+            data = cipher.decrypt(task[:16]) + cipher.decrypt(task[16:])
+            self.lastPacket = EmotivPacket(data, self.sensors)
+            self.packets.put_nowait(self.lastPacket)
+            self.packetsProcessed += 1
 
     def dequeue(self):
         try:
